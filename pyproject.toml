@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "d2-loader"
+version = "0.1.0"
+description = "Rust 加速的 GBK CSV 批量加载器"
+requires-python = ">=3.11"
+dependencies = ["polars>=0.20", "pyarrow>=14.0"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+
+[tool.maturin.environment]
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"
