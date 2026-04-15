@@ -1,4 +1,4 @@
-# d2-loader
+# gbk-csv-loader
 
 Rust 加速的 GBK 编码 CSV 批量加载器。
 
@@ -7,9 +7,9 @@ Rust 加速的 GBK 编码 CSV 批量加载器。
 ## 安装
 
 ```bash
-pip install d2-loader
+pip install gbk-csv-loader
 # 或
-uv add d2-loader
+uv add gbk-csv-loader
 ```
 
 预编译 wheel 支持：Linux (x86_64/aarch64)、macOS (Intel/ARM)、Windows (x64)、Python 3.11-3.13。
