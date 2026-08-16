@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::*;
@@ -7,6 +6,8 @@ use arrow::datatypes::{DataType, Date32Type, Field, Float64Type, Schema};
 use arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
 
+use crate::batch_util::concat_aligned;
+use crate::csv_scan::Scanner;
 use crate::gbk::decode_gbk;
 
 /// 列类型枚举，由 Python 端指定
@@ -46,7 +47,7 @@ pub enum ColumnBuilder {
 }
 
 /// 预解析日期格式，避免重复匹配
-enum DateFormat {
+pub enum DateFormat {
     /// %Y-%m-%d  (YYYY-MM-DD, 10 chars)
     Ymd,
     /// %Y%m%d    (YYYYMMDD, 8 chars)
@@ -213,40 +214,46 @@ pub fn parse_csv_from_bytes(
     columns: Option<&[String]>,
     skip_rows: usize,
     schema_spec: &SchemaSpec,
+    quoting: bool,
 ) -> Result<RecordBatch, String> {
     let text = decode_gbk(raw);
-    let mut lines = text.lines();
+    parse_csv_from_text(&text, columns, skip_rows, schema_spec, quoting)
+}
 
-    // 跳过注释行
-    for _ in 0..skip_rows {
-        lines.next();
-    }
+/// 解析已解码为 UTF-8 的 CSV 文本
+pub fn parse_csv_from_text(
+    text: &str,
+    columns: Option<&[String]>,
+    skip_rows: usize,
+    schema_spec: &SchemaSpec,
+    quoting: bool,
+) -> Result<RecordBatch, String> {
+    let mut scanner = Scanner::new(text, skip_rows, quoting);
 
     // 表头
-    let header_line = lines
-        .next()
-        .ok_or_else(|| "文件无表头".to_string())?;
-    let all_headers: Vec<&str> = header_line.split(',').map(|s| s.trim()).collect();
+    let all_headers = scanner.read_row().ok_or_else(|| "文件无表头".to_string())?;
 
     // 确定要读的列
-    let (selected_indices, selected_headers) = if let Some(cols) = columns {
+    let (selected_indices, selected_headers): (Vec<usize>, Vec<&str>) = if let Some(cols) = columns {
         let idx_map: HashMap<&str, usize> = all_headers
             .iter()
             .enumerate()
-            .map(|(i, h)| (*h, i))
+            .map(|(i, h)| (h.as_str(), i))
             .collect();
         let mut indices = Vec::new();
         let mut headers = Vec::new();
         for col in cols {
             if let Some(&idx) = idx_map.get(col.as_str()) {
                 indices.push(idx);
-                headers.push(col.as_str());
+                headers.push(all_headers[idx].as_str());
             }
         }
         (indices, headers)
     } else {
-        let indices: Vec<usize> = (0..all_headers.len()).collect();
-        (indices, all_headers)
+        (
+            (0..all_headers.len()).collect(),
+            all_headers.iter().map(|h| h.as_str()).collect(),
+        )
     };
 
     // 创建列式 builders
@@ -256,41 +263,25 @@ pub fn parse_csv_from_bytes(
         .collect();
     let mut builders: Vec<ColumnBuilder> = col_types.iter().map(ColumnBuilder::new).collect();
 
-    // 流式解析：逐行读取，直接 append 到 builder（零中间 String 分配）
-    for line in lines {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        // 手动 split by ','（比 line.split(',').collect::<Vec>() 少一次分配）
-        let mut field_start = 0;
-        let mut field_idx = 0;
-        let mut builder_cursor = 0;
-        let bytes = line.as_bytes();
-        let line_len = bytes.len();
-
-        for pos in 0..=line_len {
-            if pos == line_len || bytes[pos] == b',' {
-                if builder_cursor < selected_indices.len()
-                    && field_idx == selected_indices[builder_cursor]
-                {
-                    let val = &line[field_start..pos].trim();
-                    builders[builder_cursor].append(val);
-                    builder_cursor += 1;
-                    if builder_cursor >= selected_indices.len() {
-                        // 所有需要的列都读完了，跳过剩余字段
-                        break;
-                    }
-                }
-                field_idx += 1;
-                field_start = pos + 1;
+    // 流式解析：逐条记录扫描，直接 append 到 builder（普通字段零拷贝）
+    let mut cursor;
+    loop {
+        cursor = 0;
+        let got = scanner.next_record(|field_idx, val| {
+            if cursor < selected_indices.len() && field_idx == selected_indices[cursor] {
+                builders[cursor].append(val);
+                cursor += 1;
             }
+            // 需要的列都读完了就让扫描器快进到行尾
+            cursor < selected_indices.len()
+        });
+        if !got {
+            break;
         }
-
         // 如果行的字段数不够，补 null
-        while builder_cursor < builders.len() {
-            builders[builder_cursor].append("");
-            builder_cursor += 1;
+        while cursor < builders.len() {
+            builders[cursor].append("");
+            cursor += 1;
         }
     }
 
@@ -318,6 +309,7 @@ pub fn read_csvs_to_batch(
     skip_rows: usize,
     schema_spec: &SchemaSpec,
     io_threads: usize,
+    quoting: bool,
 ) -> Result<RecordBatch, String> {
     if paths.is_empty() {
         return Err("路径列表为空".to_string());
@@ -354,9 +346,11 @@ pub fn read_csvs_to_batch(
     // 阶段 2：rayon 并行 GBK 解码 + CSV 解析 + Arrow 构建
     let batches: Vec<Result<RecordBatch, String>> = raw_files
         .into_par_iter()
-        .map(|result| {
+        .zip(paths.par_iter())
+        .map(|(result, path)| {
             let bytes = result?;
-            parse_csv_from_bytes(&bytes, columns, skip_rows, schema_spec)
+            parse_csv_from_bytes(&bytes, columns, skip_rows, schema_spec, quoting)
+                .map_err(|e| format!("{path}: {e}"))
         })
         .collect();
 
@@ -365,11 +359,6 @@ pub fn read_csvs_to_batch(
         good_batches.push(result?);
     }
 
-    if good_batches.is_empty() {
-        return Err("无有效数据".to_string());
-    }
-
-    let schema = good_batches[0].schema();
-    arrow::compute::concat_batches(&schema, &good_batches)
-        .map_err(|e| format!("合并 RecordBatch 失败: {e}"))
+    // 按列名对齐后再合并：列数/列序不一致的文件不会再让 concat_batches 越界 panic
+    concat_aligned(&good_batches)
 }

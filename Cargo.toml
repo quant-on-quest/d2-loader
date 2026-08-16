@@ -1,18 +1,27 @@
 [package]
 name = "d2_loader"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
 name = "d2_loader"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-pyo3 = { version = "0.24", features = ["extension-module"] }
+pyo3 = { version = "0.24" }
 encoding_rs = "0.8"
-csv = "1.3"
+memchr = "2"
 rayon = "1.10"
 tokio = { version = "1", features = ["rt-multi-thread", "fs"] }
 futures = "0.3"
 arrow = { version = "55", features = ["ipc"] }
 chrono = "0.4"
+
+# 解析热路径大量调用 memchr，跨 crate 内联对吞吐影响明显
+[profile.release]
+lto = true
+codegen-units = 1

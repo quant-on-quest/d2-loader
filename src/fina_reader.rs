@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::*;
-use arrow::datatypes::{DataType, Date32Type, Field, Float64Type, Schema};
+use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
 
+use crate::batch_util::concat_aligned;
+use crate::csv_scan::Scanner;
 use crate::gbk::decode_gbk;
 use crate::stock_reader::{ColType, ColumnBuilder, SchemaSpec};
 
@@ -18,18 +20,12 @@ fn parse_fina_csv_from_bytes(
     skip_rows: usize,
     schema_spec: &SchemaSpec,
     renames: &HashMap<String, String>,
+    quoting: bool,
 ) -> Result<RecordBatch, String> {
     let text = decode_gbk(raw);
-    let mut lines = text.lines();
+    let mut scanner = Scanner::new(&text, skip_rows, quoting);
 
-    for _ in 0..skip_rows {
-        lines.next();
-    }
-
-    let header_line = lines
-        .next()
-        .ok_or_else(|| "文件无表头".to_string())?;
-    let raw_headers: Vec<&str> = header_line.split(',').map(|s| s.trim()).collect();
+    let raw_headers = scanner.read_row().ok_or_else(|| "文件无表头".to_string())?;
 
     // 过滤排除列，确定保留的列索引和最终列名
     let mut keep_indices: Vec<usize> = Vec::new();
@@ -39,7 +35,7 @@ fn parse_fina_csv_from_bytes(
             continue;
         }
         keep_indices.push(i);
-        let name = renames.get(*h).cloned().unwrap_or_else(|| h.to_string());
+        let name = renames.get(h).cloned().unwrap_or_else(|| h.to_string());
         final_headers.push(name);
     }
 
@@ -51,16 +47,23 @@ fn parse_fina_csv_from_bytes(
     let mut builders: Vec<ColumnBuilder> = col_types.iter().map(ColumnBuilder::new).collect();
 
     // 流式解析
-    for line in lines {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    let mut cursor;
+    loop {
+        cursor = 0;
+        let got = scanner.next_record(|field_idx, val| {
+            if cursor < keep_indices.len() && field_idx == keep_indices[cursor] {
+                builders[cursor].append(val);
+                cursor += 1;
+            }
+            cursor < keep_indices.len()
+        });
+        if !got {
+            break;
         }
-        // 按 ',' 分割字段
-        let fields: Vec<&str> = line.split(',').collect();
-        for (builder_idx, &col_idx) in keep_indices.iter().enumerate() {
-            let val = fields.get(col_idx).map(|s| s.trim()).unwrap_or("");
-            builders[builder_idx].append(val);
+        // 字段数不够的行补 null
+        while cursor < builders.len() {
+            builders[cursor].append("");
+            cursor += 1;
         }
     }
 
@@ -85,6 +88,7 @@ pub fn read_fina_csvs_to_batch(
     schema_spec: &SchemaSpec,
     renames: &HashMap<String, String>,
     io_threads: usize,
+    quoting: bool,
 ) -> Result<RecordBatch, String> {
     if paths.is_empty() {
         return Err("路径列表为空".to_string());
@@ -120,93 +124,23 @@ pub fn read_fina_csvs_to_batch(
     // 阶段 2：rayon 并行解析
     let results: Vec<Result<RecordBatch, String>> = raw_files
         .into_par_iter()
-        .map(|result| {
+        .zip(paths.par_iter())
+        .map(|(result, path)| {
             let bytes = result?;
-            parse_fina_csv_from_bytes(&bytes, skip_rows, schema_spec, renames)
+            parse_fina_csv_from_bytes(&bytes, skip_rows, schema_spec, renames, quoting)
+                .map_err(|e| format!("{path}: {e}"))
         })
         .collect();
 
-    let mut batches: Vec<RecordBatch> = Vec::new();
+    // 解析失败不再只打 stderr 后静默跳过——那会让调用方拿到少了行的结果还以为成功
+    let mut batches: Vec<RecordBatch> = Vec::with_capacity(results.len());
     for r in results {
-        match r {
-            Ok(batch) if batch.num_rows() > 0 => batches.push(batch),
-            Ok(_) => {} // 空 batch 跳过
-            Err(e) => eprintln!("警告: {e}"),
+        let batch = r?;
+        if batch.num_rows() > 0 {
+            batches.push(batch);
         }
     }
 
-    if batches.is_empty() {
-        return Err("无有效数据".to_string());
-    }
-
-    // 收集全局列名（保持出现顺序）
-    let mut all_col_order: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for batch in &batches {
-        for field in batch.schema().fields() {
-            let name = field.name().clone();
-            if seen.insert(name.clone()) {
-                all_col_order.push(name);
-            }
-        }
-    }
-
-    // 构建全局 schema
-    let global_fields: Vec<Field> = all_col_order
-        .iter()
-        .map(|name| {
-            // 找到该列在某个 batch 中的类型
-            for batch in &batches {
-                if let Some((idx, _)) = batch.schema().column_with_name(name) {
-                    return batch.schema().field(idx).clone();
-                }
-            }
-            // 全部 batch 都没有该列（不应发生）→ 默认 Float64
-            Field::new(name, DataType::Float64, true)
-        })
-        .collect();
-    let global_schema = Arc::new(Schema::new(global_fields));
-
-    // 对齐每个 batch 到全局 schema（缺失列补 null）
-    let aligned: Vec<RecordBatch> = batches
-        .into_iter()
-        .map(|batch| align_batch_to_schema(&batch, &global_schema))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    arrow::compute::concat_batches(&global_schema, &aligned)
-        .map_err(|e| format!("合并 RecordBatch 失败: {e}"))
-}
-
-/// 将 batch 对齐到目标 schema：补缺失列为 null 数组
-fn align_batch_to_schema(
-    batch: &RecordBatch,
-    target_schema: &Arc<Schema>,
-) -> Result<RecordBatch, String> {
-    let num_rows = batch.num_rows();
-    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(target_schema.fields().len());
-
-    for field in target_schema.fields() {
-        if let Some((idx, _)) = batch.schema().column_with_name(field.name()) {
-            let col = batch.column(idx);
-            // 类型一致直接用，否则 cast
-            if col.data_type() == field.data_type() {
-                columns.push(col.clone());
-            } else {
-                // 尝试 cast（如 Int64 → Float64）
-                match arrow::compute::cast(col.as_ref(), field.data_type()) {
-                    Ok(casted) => columns.push(casted),
-                    Err(_) => {
-                        // cast 失败，填 null
-                        columns.push(new_null_array(field.data_type(), num_rows));
-                    }
-                }
-            }
-        } else {
-            // 该列在此 batch 中不存在，补 null
-            columns.push(new_null_array(field.data_type(), num_rows));
-        }
-    }
-
-    RecordBatch::try_new(target_schema.clone(), columns)
-        .map_err(|e| format!("对齐 RecordBatch 失败: {e}"))
+    // 列名并集 + 缺失列补 null（diagonal concat）
+    concat_aligned(&batches)
 }

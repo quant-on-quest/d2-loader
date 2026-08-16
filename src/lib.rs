@@ -1,8 +1,11 @@
+pub mod batch_util;
+pub mod csv_scan;
 pub mod fina_reader;
 pub mod gbk;
 pub mod stock_reader;
 
 use std::collections::{HashMap, HashSet};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use arrow::ipc::writer::StreamWriter;
 use pyo3::prelude::*;
@@ -36,6 +39,26 @@ fn parse_schema(overrides: Option<&Bound<PyDict>>) -> PyResult<SchemaSpec> {
         string_cols,
         date_cols,
     })
+}
+
+/// 把 Rust 侧的工作包起来，任何 panic 都转成普通的 RuntimeError。
+///
+/// pyo3 默认把 panic 转成 PanicException，它继承 BaseException，
+/// Python 侧的 `except Exception` 兜不住，会直接打死调用方进程。
+fn guard<T>(f: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = e
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "未知错误".to_string());
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "读取 CSV 时发生内部错误: {msg}"
+            )))
+        }
+    }
 }
 
 /// Arrow RecordBatch → IPC bytes → pyarrow → polars DataFrame
@@ -73,6 +96,11 @@ fn batch_to_py(py: Python<'_>, batch: arrow::record_batch::RecordBatch) -> PyRes
 ///         - "str": 字符串
 ///         - "date:%Y-%m-%d": 日期（指定格式）
 ///         - "float64": 浮点数（默认）
+///     quoting: 是否处理双引号（默认 True）
+///         - True: `"a,b"` 是一个字段，`""` 是转义引号，引号内换行不断行；
+///                 闭合引号后不是分隔符时按字面引号处理（不丢字符），
+///                 适配没有按 RFC4180 转义的数据源
+///         - False: 引号是普通字面字符，只按逗号和换行切分
 ///
 /// Returns:
 ///     polars.DataFrame
@@ -84,7 +112,7 @@ fn batch_to_py(py: Python<'_>, batch: arrow::record_batch::RecordBatch) -> PyRes
 ///         schema={"股票代码": "str", "交易日期": "date:%Y-%m-%d"}
 ///     )
 #[pyfunction]
-#[pyo3(signature = (paths, columns=None, skip_rows=1, schema=None, io_threads=256))]
+#[pyo3(signature = (paths, columns=None, skip_rows=1, schema=None, io_threads=256, quoting=true))]
 fn read_csvs(
     py: Python<'_>,
     paths: &Bound<PyList>,
@@ -92,13 +120,22 @@ fn read_csvs(
     skip_rows: usize,
     schema: Option<&Bound<PyDict>>,
     io_threads: usize,
+    quoting: bool,
 ) -> PyResult<PyObject> {
     let paths: Vec<String> = paths.extract()?;
     let schema_spec = parse_schema(schema)?;
-    let cols_ref = columns.as_deref();
 
-    let batch = stock_reader::read_csvs_to_batch(&paths, cols_ref, skip_rows, &schema_spec, io_threads)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let batch = guard(|| {
+        stock_reader::read_csvs_to_batch(
+            &paths,
+            columns.as_deref(),
+            skip_rows,
+            &schema_spec,
+            io_threads,
+            quoting,
+        )
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    })?;
 
     batch_to_py(py, batch)
 }
@@ -112,11 +149,12 @@ fn read_csvs(
 ///     skip_rows: 跳过文件开头的行数（默认 1）
 ///     schema: 可选，列类型定义 dict（同 read_csvs）
 ///     renames: 可选，列重命名 dict（如 {"stock_code": "code"}）
+///     quoting: 是否处理双引号（默认 True，同 read_csvs）
 ///
 /// Returns:
 ///     polars.DataFrame
 #[pyfunction]
-#[pyo3(signature = (paths, skip_rows=1, schema=None, renames=None, io_threads=256))]
+#[pyo3(signature = (paths, skip_rows=1, schema=None, renames=None, io_threads=256, quoting=true))]
 fn read_csvs_diagonal(
     py: Python<'_>,
     paths: &Bound<PyList>,
@@ -124,6 +162,7 @@ fn read_csvs_diagonal(
     schema: Option<&Bound<PyDict>>,
     renames: Option<&Bound<PyDict>>,
     io_threads: usize,
+    quoting: bool,
 ) -> PyResult<PyObject> {
     let paths: Vec<String> = paths.extract()?;
     let schema_spec = parse_schema(schema)?;
@@ -136,9 +175,17 @@ fn read_csvs_diagonal(
         HashMap::new()
     };
 
-    let batch =
-        fina_reader::read_fina_csvs_to_batch(&paths, skip_rows, &schema_spec, &rename_map, io_threads)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let batch = guard(|| {
+        fina_reader::read_fina_csvs_to_batch(
+            &paths,
+            skip_rows,
+            &schema_spec,
+            &rename_map,
+            io_threads,
+            quoting,
+        )
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    })?;
 
     batch_to_py(py, batch)
 }
@@ -166,7 +213,7 @@ fn read_stock_csvs(
     }
     schema_dict.set_item("交易日期", "date:%Y-%m-%d")?;
 
-    read_csvs(py, paths, columns, 1, Some(&schema_dict), 256)
+    read_csvs(py, paths, columns, 1, Some(&schema_dict), 256, true)
 }
 
 /// 向后兼容：read_fina_csvs
@@ -182,7 +229,7 @@ fn read_fina_csvs(py: Python<'_>, paths: &Bound<PyList>) -> PyResult<PyObject> {
     let renames = PyDict::new(py);
     renames.set_item("stock_code", "code")?;
 
-    read_csvs_diagonal(py, paths, 1, Some(&schema_dict), Some(&renames), 256)
+    read_csvs_diagonal(py, paths, 1, Some(&schema_dict), Some(&renames), 256, true)
 }
 
 /// d2_loader - Rust 加速的 GBK CSV 批量加载器
