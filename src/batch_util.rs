@@ -61,8 +61,8 @@ pub fn align_batch_to_schema(
         .map_err(|e| format!("对齐 RecordBatch 失败: {e}"))
 }
 
-/// 先按列名对齐再合并，避免 concat_batches 在列数不齐时 panic
-pub fn concat_aligned(batches: &[RecordBatch]) -> Result<RecordBatch, String> {
+/// 按列名把一批 batch 对齐到同一个 schema（不做拷贝合并）
+pub fn align_all(batches: &[RecordBatch]) -> Result<(SchemaRef, Vec<RecordBatch>), String> {
     if batches.is_empty() {
         return Err("无有效数据".to_string());
     }
@@ -71,6 +71,12 @@ pub fn concat_aligned(batches: &[RecordBatch]) -> Result<RecordBatch, String> {
         .iter()
         .map(|b| align_batch_to_schema(b, &schema))
         .collect::<Result<Vec<_>, _>>()?;
+    Ok((schema, aligned))
+}
+
+/// 先按列名对齐再合并，避免 concat_batches 在列数不齐时 panic
+pub fn concat_aligned(batches: &[RecordBatch]) -> Result<RecordBatch, String> {
+    let (schema, aligned) = align_all(batches)?;
     arrow::compute::concat_batches(&schema, &aligned)
         .map_err(|e| format!("合并 RecordBatch 失败: {e}"))
 }

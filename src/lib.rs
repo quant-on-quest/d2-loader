@@ -1,4 +1,5 @@
 pub mod batch_util;
+pub mod chunked_io;
 pub mod csv_scan;
 pub mod fina_reader;
 pub mod gbk;
@@ -11,33 +12,63 @@ use arrow::ipc::writer::StreamWriter;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use stock_reader::SchemaSpec;
+use stock_reader::{ColType, ParseOptions, SchemaSpec};
+
+/// 把 "str" / "int64" / "float64" / "date:FMT" 解析成 ColType
+fn parse_col_type(typ: &str) -> PyResult<ColType> {
+    match typ {
+        "str" => Ok(ColType::Str),
+        "int64" => Ok(ColType::Int64),
+        "float64" => Ok(ColType::Float64),
+        other => match other.strip_prefix("date:") {
+            Some(fmt) => Ok(ColType::Date {
+                format: fmt.to_string(),
+            }),
+            None => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "不认识的列类型 {other:?}，可用: \"str\" / \"int64\" / \"float64\" / \"date:%Y-%m-%d\""
+            ))),
+        },
+    }
+}
 
 /// 从 Python dict 构建 SchemaSpec
 ///
-/// schema_overrides 格式：
-///     {"列名": "str", "列名": "date:%Y-%m-%d", "列名": "float64"}
-///     未指定的列默认当 float64
-fn parse_schema(overrides: Option<&Bound<PyDict>>) -> PyResult<SchemaSpec> {
+/// schema 格式：
+///     {"列名": "str", "列名": "date:%Y-%m-%d", "列名": "int64", "列名": "float64"}
+///     未指定的列走 default_type
+fn parse_schema(overrides: Option<&Bound<PyDict>>, default_type: &str) -> PyResult<SchemaSpec> {
     let mut string_cols = HashSet::new();
     let mut date_cols = HashMap::new();
+    let mut int_cols = HashSet::new();
+    let mut float_cols = HashSet::new();
 
     if let Some(d) = overrides {
         for (key, val) in d.iter() {
             let col: String = key.extract()?;
             let typ: String = val.extract()?;
-            if typ == "str" {
-                string_cols.insert(col);
-            } else if let Some(fmt) = typ.strip_prefix("date:") {
-                date_cols.insert(col, fmt.to_string());
+            match parse_col_type(&typ)? {
+                ColType::Str => {
+                    string_cols.insert(col);
+                }
+                ColType::Int64 => {
+                    int_cols.insert(col);
+                }
+                ColType::Float64 => {
+                    float_cols.insert(col);
+                }
+                ColType::Date { format } => {
+                    date_cols.insert(col, format);
+                }
             }
-            // "float64" 或其他 → 走默认
         }
     }
 
     Ok(SchemaSpec {
         string_cols,
         date_cols,
+        int_cols,
+        float_cols,
+        default_type: parse_col_type(default_type)?,
     })
 }
 
@@ -61,19 +92,29 @@ fn guard<T>(f: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
     }
 }
 
-/// Arrow RecordBatch → IPC bytes → pyarrow → polars DataFrame
-fn batch_to_py(py: Python<'_>, batch: arrow::record_batch::RecordBatch) -> PyResult<PyObject> {
+/// Arrow RecordBatch 列表 → IPC bytes → pyarrow → polars DataFrame
+///
+/// 多个 batch 直接写进同一个 IPC 流，pyarrow 读成 chunked Table，
+/// 省掉先 concat 成一整块的那份完整拷贝。
+fn batches_to_py(
+    py: Python<'_>,
+    schema: arrow::datatypes::SchemaRef,
+    batches: Vec<arrow::record_batch::RecordBatch>,
+) -> PyResult<PyObject> {
     let mut buf = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())
+        let mut writer = StreamWriter::try_new(&mut buf, &schema)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("IPC writer: {e}")))?;
-        writer
-            .write(&batch)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("IPC write: {e}")))?;
+        for batch in &batches {
+            writer
+                .write(batch)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("IPC write: {e}")))?;
+        }
         writer
             .finish()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("IPC finish: {e}")))?;
     }
+    drop(batches);
 
     let bytes = pyo3::types::PyBytes::new(py, &buf);
     let pa = py.import("pyarrow")?;
@@ -90,12 +131,17 @@ fn batch_to_py(py: Python<'_>, batch: arrow::record_batch::RecordBatch) -> PyRes
 ///
 /// Args:
 ///     paths: CSV 文件路径列表
-///     columns: 可选，要读取的列名列表
+///     columns: 可选，要读取的列名列表（按列名映射，顺序任意；
+///         输出列顺序与本参数一致，文件里没有的列输出为整列 null）
 ///     skip_rows: 跳过文件开头的行数（默认 1，跳过注释行）
 ///     schema: 可选，列类型定义 dict
 ///         - "str": 字符串
 ///         - "date:%Y-%m-%d": 日期（指定格式）
 ///         - "float64": 浮点数（默认）
+///     default_type: 未在 schema 中声明的列按什么类型解析（默认 "float64"）
+///         未声明的列如果非空值全部解析失败，会直接报错而不是静默产出全 null
+///     trim: 是否剥离字符串字段的首尾空白（默认 True）
+///         数值/日期列不受影响，始终按 trim 后的值解析
 ///     quoting: 是否处理双引号（默认 True）
 ///         - True: `"a,b"` 是一个字段，`""` 是转义引号，引号内换行不断行；
 ///                 闭合引号后不是分隔符时按字面引号处理（不丢字符），
@@ -112,7 +158,7 @@ fn batch_to_py(py: Python<'_>, batch: arrow::record_batch::RecordBatch) -> PyRes
 ///         schema={"股票代码": "str", "交易日期": "date:%Y-%m-%d"}
 ///     )
 #[pyfunction]
-#[pyo3(signature = (paths, columns=None, skip_rows=1, schema=None, io_threads=256, quoting=true))]
+#[pyo3(signature = (paths, columns=None, skip_rows=1, schema=None, io_threads=256, quoting=true, default_type="float64", trim=true))]
 fn read_csvs(
     py: Python<'_>,
     paths: &Bound<PyList>,
@@ -121,23 +167,29 @@ fn read_csvs(
     schema: Option<&Bound<PyDict>>,
     io_threads: usize,
     quoting: bool,
+    default_type: &str,
+    trim: bool,
 ) -> PyResult<PyObject> {
     let paths: Vec<String> = paths.extract()?;
-    let schema_spec = parse_schema(schema)?;
+    let schema_spec = parse_schema(schema, default_type)?;
+    let opts = ParseOptions {
+        skip_rows,
+        quoting,
+        trim,
+    };
 
-    let batch = guard(|| {
-        stock_reader::read_csvs_to_batch(
+    let (schema, batches) = guard(|| {
+        stock_reader::read_csvs_to_batches(
             &paths,
             columns.as_deref(),
-            skip_rows,
             &schema_spec,
+            &opts,
             io_threads,
-            quoting,
         )
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     })?;
 
-    batch_to_py(py, batch)
+    batches_to_py(py, schema, batches)
 }
 
 /// 批量读取异构 schema 的 GBK CSV 文件（如财务数据）
@@ -149,12 +201,12 @@ fn read_csvs(
 ///     skip_rows: 跳过文件开头的行数（默认 1）
 ///     schema: 可选，列类型定义 dict（同 read_csvs）
 ///     renames: 可选，列重命名 dict（如 {"stock_code": "code"}）
-///     quoting: 是否处理双引号（默认 True，同 read_csvs）
+///     quoting / default_type / trim: 同 read_csvs
 ///
 /// Returns:
 ///     polars.DataFrame
 #[pyfunction]
-#[pyo3(signature = (paths, skip_rows=1, schema=None, renames=None, io_threads=256, quoting=true))]
+#[pyo3(signature = (paths, skip_rows=1, schema=None, renames=None, io_threads=256, quoting=true, default_type="float64", trim=true))]
 fn read_csvs_diagonal(
     py: Python<'_>,
     paths: &Bound<PyList>,
@@ -163,9 +215,16 @@ fn read_csvs_diagonal(
     renames: Option<&Bound<PyDict>>,
     io_threads: usize,
     quoting: bool,
+    default_type: &str,
+    trim: bool,
 ) -> PyResult<PyObject> {
     let paths: Vec<String> = paths.extract()?;
-    let schema_spec = parse_schema(schema)?;
+    let schema_spec = parse_schema(schema, default_type)?;
+    let opts = ParseOptions {
+        skip_rows,
+        quoting,
+        trim,
+    };
 
     let rename_map: HashMap<String, String> = if let Some(r) = renames {
         r.iter()
@@ -175,19 +234,18 @@ fn read_csvs_diagonal(
         HashMap::new()
     };
 
-    let batch = guard(|| {
-        fina_reader::read_fina_csvs_to_batch(
+    let (schema, batches) = guard(|| {
+        fina_reader::read_fina_csvs_to_batches(
             &paths,
-            skip_rows,
             &schema_spec,
             &rename_map,
+            &opts,
             io_threads,
-            quoting,
         )
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     })?;
 
-    batch_to_py(py, batch)
+    batches_to_py(py, schema, batches)
 }
 
 // === 向后兼容旧 API ===
@@ -213,7 +271,7 @@ fn read_stock_csvs(
     }
     schema_dict.set_item("交易日期", "date:%Y-%m-%d")?;
 
-    read_csvs(py, paths, columns, 1, Some(&schema_dict), 256, true)
+    read_csvs(py, paths, columns, 1, Some(&schema_dict), 256, true, "float64", true)
 }
 
 /// 向后兼容：read_fina_csvs
@@ -229,7 +287,7 @@ fn read_fina_csvs(py: Python<'_>, paths: &Bound<PyList>) -> PyResult<PyObject> {
     let renames = PyDict::new(py);
     renames.set_item("stock_code", "code")?;
 
-    read_csvs_diagonal(py, paths, 1, Some(&schema_dict), Some(&renames), 256, true)
+    read_csvs_diagonal(py, paths, 1, Some(&schema_dict), Some(&renames), 256, true, "float64", true)
 }
 
 /// d2_loader - Rust 加速的 GBK CSV 批量加载器

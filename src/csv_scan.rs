@@ -25,12 +25,14 @@ pub struct Scanner<'a> {
     bytes: &'a [u8],
     pos: usize,
     quoting: bool,
+    /// 是否剥离字段首尾空白；false 时按字面值返回（与 polars read_csv 一致）
+    trim: bool,
     buf: String,
 }
 
 impl<'a> Scanner<'a> {
     /// 跳过 `skip_rows` 个物理行后开始扫描
-    pub fn new(text: &'a str, skip_rows: usize, quoting: bool) -> Self {
+    pub fn new(text: &'a str, skip_rows: usize, quoting: bool, trim: bool) -> Self {
         let bytes = text.as_bytes();
         let mut pos = 0;
         for _ in 0..skip_rows {
@@ -47,6 +49,7 @@ impl<'a> Scanner<'a> {
             bytes,
             pos,
             quoting,
+            trim,
             buf: String::new(),
         }
     }
@@ -150,14 +153,14 @@ impl<'a> Scanner<'a> {
         }
 
         match memchr2(b',', b'\n', &b[start..]) {
-            None => (Self::trimmed(self.text, start, len), len, true),
+            None => (self.plain_field(start, len), len, true),
             Some(off) => {
                 let p = start + off;
                 let mut end = p;
                 if b[p] == b'\n' && end > start && b[end - 1] == b'\r' {
                     end -= 1;
                 }
-                (Self::trimmed(self.text, start, end), p + 1, b[p] == b'\n')
+                (self.plain_field(start, end), p + 1, b[p] == b'\n')
             }
         }
     }
@@ -175,6 +178,7 @@ impl<'a> Scanner<'a> {
                 // 引号未闭合就到文件末尾：把剩下的都当字段内容
                 None => {
                     self.buf.push_str(&self.text[seg_start..len]);
+                    self.finish_quoted();
                     return (FieldPos::Buffered, len, true);
                 }
                 Some(off) => i + off,
@@ -199,6 +203,7 @@ impl<'a> Scanner<'a> {
                     j += 1;
                 }
                 let eor = j >= len || b[j] == b'\n';
+                self.finish_quoted();
                 return (FieldPos::Buffered, j + 1, eor);
             }
 
@@ -210,11 +215,25 @@ impl<'a> Scanner<'a> {
     }
 
     #[inline]
-    fn trimmed(text: &str, start: usize, end: usize) -> FieldPos {
-        let s = &text[start..end];
+    fn plain_field(&self, start: usize, end: usize) -> FieldPos {
+        if !self.trim {
+            return FieldPos::Borrowed(start, end);
+        }
+        let s = &self.text[start..end];
         let a = start + (s.len() - s.trim_start().len());
         let trimmed = s.trim();
         FieldPos::Borrowed(a, a + trimmed.len())
+    }
+
+    /// 引号字段的内容也按 trim 选项处理，与非引号字段保持一致
+    #[inline]
+    fn finish_quoted(&mut self) {
+        if self.trim {
+            let t = self.buf.trim();
+            if t.len() != self.buf.len() {
+                self.buf = t.to_string();
+            }
+        }
     }
 
     /// 读取一条记录的全部字段（用于表头）
@@ -237,7 +256,7 @@ mod tests {
     use super::*;
 
     fn rows(text: &str, quoting: bool) -> Vec<Vec<String>> {
-        let mut sc = Scanner::new(text, 0, quoting);
+        let mut sc = Scanner::new(text, 0, quoting, true);
         let mut out = Vec::new();
         while let Some(r) = sc.read_row() {
             out.push(r);
@@ -317,7 +336,7 @@ mod tests {
 
     #[test]
     fn early_exit_skips_rest_of_row() {
-        let mut sc = Scanner::new("a,b,c,d\n1,2,3,4\n", 0, true);
+        let mut sc = Scanner::new("a,b,c,d\n1,2,3,4\n", 0, true, true);
         let mut first = Vec::new();
         sc.next_record(|i, v| {
             first.push(v.to_string());
@@ -330,7 +349,7 @@ mod tests {
 
     #[test]
     fn early_exit_is_quote_aware() {
-        let mut sc = Scanner::new("a,b,\"含\n换行\"\n1,2,3\n", 0, true);
+        let mut sc = Scanner::new("a,b,\"含\n换行\"\n1,2,3\n", 0, true, true);
         let mut first = Vec::new();
         sc.next_record(|_, v| {
             first.push(v.to_string());
