@@ -100,7 +100,7 @@ fn batches_to_py(
     py: Python<'_>,
     schema: arrow::datatypes::SchemaRef,
     batches: Vec<arrow::record_batch::RecordBatch>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let mut buf = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut buf, &schema)
@@ -169,7 +169,7 @@ fn read_csvs(
     quoting: bool,
     default_type: &str,
     trim: bool,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let paths: Vec<String> = paths.extract()?;
     let schema_spec = parse_schema(schema, default_type)?;
     let opts = ParseOptions {
@@ -217,7 +217,7 @@ fn read_csvs_diagonal(
     quoting: bool,
     default_type: &str,
     trim: bool,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let paths: Vec<String> = paths.extract()?;
     let schema_spec = parse_schema(schema, default_type)?;
     let opts = ParseOptions {
@@ -257,7 +257,7 @@ fn read_stock_csvs(
     py: Python<'_>,
     paths: &Bound<PyList>,
     columns: Option<Vec<String>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     // 使用框架默认 schema
     let schema_dict = PyDict::new(py);
     for col in &[
@@ -276,7 +276,7 @@ fn read_stock_csvs(
 
 /// 向后兼容：read_fina_csvs
 #[pyfunction]
-fn read_fina_csvs(py: Python<'_>, paths: &Bound<PyList>) -> PyResult<PyObject> {
+fn read_fina_csvs(py: Python<'_>, paths: &Bound<PyList>) -> PyResult<Py<PyAny>> {
     let schema_dict = PyDict::new(py);
     for col in &["code", "stock_code", "statement_format"] {
         schema_dict.set_item(*col, "str")?;

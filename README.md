@@ -12,7 +12,9 @@ pip install gbk-csv-loader
 uv add gbk-csv-loader
 ```
 
-预编译 wheel 支持：Linux (x86_64/aarch64)、macOS (Intel/ARM)、Windows (x64)、Python 3.11-3.13。
+预编译 wheel 支持：Linux (x86_64/aarch64)、macOS (Intel/ARM)、Windows (x64)。
+
+wheel 是 abi3 的（`cp311-abi3`），一个文件覆盖 CPython 3.11 及之后的所有版本，包括 3.14 —— 新 Python 发布时不需要等新 wheel。
 
 ## 使用
 
@@ -97,6 +99,16 @@ Rust 侧的 panic 也会被转成 `RuntimeError`，不会再以 `PanicException`
 各文件列数、列序不一致时按列名取并集对齐，缺失列补 null，不会中断整批读取。
 
 ## 变更
+
+### 0.4.0
+
+- wheel 改为 abi3（`cp311-abi3`）：一个文件覆盖 CPython 3.11+，**新增 3.14 支持**。
+  此前每个 Python 版本一个 wheel，3.14 发布后装不上；现在新 Python 版本不需要重新发版。
+- PyO3 0.24 → 0.29（0.24 本身不支持 3.14）。`PyObject` 别名在 0.29 移除，改用 `Py<PyAny>`，
+  仅此一处破坏性改动，无行为变化。
+- 发布流程新增 sdist。
+
+无 API 变更，输出与 0.3.0 逐值一致（30 个测试在 3.12 与 3.14 上均通过）。
 
 ### 0.3.0
 
